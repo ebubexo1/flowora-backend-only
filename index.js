@@ -513,7 +513,7 @@ app.post('/api/sales', requireAuth, requireFeature('sales'), async (req, res) =>
       reference:     reference || null,
       status:        status || (reference ? 'pending' : 'completed'),
       synced:        reference ? 0 : 1,
-      verified:      !!(reference && status === 'completed'),
+      verified:      paymentMethod === 'cash' || !!(reference && status === 'completed'),
       provider:      reference ? 'paystack' : 'cash',
       profit:        typeof profit === 'number' ? profit : 0,
       createdAt:     new Date(),
