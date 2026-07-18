@@ -642,11 +642,10 @@ const buildFinancialSummary = async (userId) => {
     Expense.find({ userId }),
     Invoice.find({ userId }),
   ]);
-
   const totalRevenue  = completedSales.reduce((sum, s) => sum + (s.total || 0), 0);
   const totalExpenses = expenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-  const netProfit     = totalRevenue - totalExpenses;
-
+  const grossProfit   = completedSales.reduce((sum, s) => sum + (typeof s.profit === 'number' ? s.profit : (s.total || 0)), 0);
+  const netProfit      = grossProfit - totalExpenses;
   const invoiceTotal       = invoices.reduce((sum, i) => sum + (i.amount || 0), 0);
   const invoicePaid        = invoices.filter(i => i.status === 'paid').reduce((sum, i) => sum + (i.amount || 0), 0);
   const invoiceOutstanding = invoiceTotal - invoicePaid;
