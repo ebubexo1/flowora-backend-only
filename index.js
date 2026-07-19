@@ -3,6 +3,19 @@ dns.setServers(['8.8.8.8', '8.8.4.4']);
 
 require('dotenv').config();
 
+// ── Error monitoring (Sentry) ──
+// Set SENTRY_DSN in your environment to enable. Leaving it unset is safe —
+// Sentry.init() with an empty DSN is a documented no-op.
+const Sentry = require('@sentry/node');
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: process.env.NODE_ENV || 'production',
+    tracesSampleRate: 0.1,
+  });
+  console.log('Sentry error monitoring enabled');
+}
+
 // ── Security ──
 const helmet        = require('helmet');
 const rateLimit     = require('express-rate-limit');
@@ -28,6 +41,10 @@ const bcrypt         = require('bcryptjs');
 const jwt            = require('jsonwebtoken');
 const mongoose       = require('mongoose');
 const { getPlanList, buildSubscriptionSummary, requireFeature } = require('./src/middleware/plan');
+const notificationRoutes = require('./src/routes/notifications');
+const notify = require('./src/utils/notify');
+const cron = require('node-cron');
+const { runReminders, runFollowups } = require('./src/routes/bookings');
 
 // ── Resend Email Configuration ──
 const { Resend } = require('resend');
@@ -731,6 +748,7 @@ app.post('/api/subscription/upgrade', requireAuth, async (req, res) => {
     if (plan.price === 0) {
       user.plan = planId;
       await user.save();
+      await notify(user._id, 'Subscription updated', `You're now on the ${plan.name || planId} plan.`, 'subscription');
       return res.json({ success: true, subscription: await buildSubscriptionSummary(req.user.id), user: formatUserResponse(user) });
     }
 
@@ -774,6 +792,8 @@ app.get('/api/subscription/verify/:reference', requireAuth, async (req, res) => 
         const user = await User.findById(req.user.id);
         user.plan = planId;
         await user.save();
+        const plan = getPlanList().find((p) => p.id === planId);
+        await notify(user._id, 'Subscription upgraded', `Payment received — you're now on the ${plan?.name || planId} plan.`, 'subscription');
         return res.json({ success: true, subscription: await buildSubscriptionSummary(req.user.id), user: formatUserResponse(user) });
       }
     }
@@ -818,6 +838,8 @@ app.get('/api/payments/verify/:reference', requireAuth, async (req, res) => {
       { id: reference, userId: req.user.id },
       { synced: 1, verified: true, status: 'completed', provider: 'paystack' }
     );
+  } else {
+    await notify(req.user.id, 'Payment failed', `We couldn't verify payment for sale reference ${reference}.`, 'payment');
   }
 
   res.json({ success: isVerified, verified: isVerified, amount, reference });
@@ -839,6 +861,43 @@ app.use('/api/invoices',  invoiceRoutes);
 app.use('/api/customers', customerRoutes);
 app.use('/api/waitlist',  waitlistRoutes);
 app.use('/api/events',    eventRoutes);
+app.use('/api/notifications', notificationRoutes);
+
+// ── Sentry error handler — must be registered after all routes ──
+if (process.env.SENTRY_DSN) {
+  Sentry.setupExpressErrorHandler(app);
+}
+
+// ── SCHEDULED REMINDERS ──
+// Only enable this on an always-on host (e.g. Railway, Render, a VPS).
+// On serverless hosts (e.g. Vercel) the process doesn't stay alive between
+// requests, so leave ENABLE_CRON unset and instead point an external
+// scheduler (cron-job.org, GitHub Actions, etc.) at:
+//   GET /api/bookings/run-reminders?key=REMINDER_SECRET
+//   GET /api/bookings/run-followups?key=REMINDER_SECRET
+if (process.env.ENABLE_CRON === 'true') {
+  // Every hour, on the hour: check tomorrow's confirmed bookings and email reminders.
+  cron.schedule('0 * * * *', async () => {
+    try {
+      const result = await runReminders();
+      if (result.sent > 0) console.log(`[cron] Sent ${result.sent} reminder email(s) for ${result.date}`);
+    } catch (err) {
+      console.error('[cron] Reminder job failed:', err.message);
+    }
+  });
+
+  // Every hour, at :30: check yesterday's confirmed bookings and send follow-ups.
+  cron.schedule('30 * * * *', async () => {
+    try {
+      const result = await runFollowups();
+      if (result.sent > 0) console.log(`[cron] Sent ${result.sent} follow-up email(s) for ${result.date}`);
+    } catch (err) {
+      console.error('[cron] Follow-up job failed:', err.message);
+    }
+  });
+
+  console.log('Cron scheduler enabled: reminders hourly, follow-ups hourly (offset 30m)');
+}
 
 // Start Server Listen Setup
 connectToDatabase().then(() => {
