@@ -900,6 +900,7 @@ if (process.env.ENABLE_CRON === 'true') {
 }
 
 // Start Server Listen Setup
+app.get('/api/test-sentry', () => { throw new Error('Sentry test error'); });
 connectToDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`Backend Application listening securely on port ${PORT}`);
