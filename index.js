@@ -4,8 +4,6 @@ dns.setServers(['8.8.8.8', '8.8.4.4']);
 require('dotenv').config();
 
 // ── Error monitoring (Sentry) ──
-// Set SENTRY_DSN in your environment to enable. Leaving it unset is safe —
-// Sentry.init() with an empty DSN is a documented no-op.
 const Sentry = require('@sentry/node');
 if (process.env.SENTRY_DSN) {
   Sentry.init({
@@ -40,7 +38,7 @@ const axios          = require('axios');
 const bcrypt         = require('bcryptjs');
 const jwt            = require('jsonwebtoken');
 const mongoose       = require('mongoose');
-const { getPlanList, buildSubscriptionSummary, requireFeature } = require('./src/middleware/plan');
+const { getPlan, getPlanList, buildSubscriptionSummary, requireFeature } = require('./src/middleware/plan');
 const notificationRoutes = require('./src/routes/notifications');
 const notify = require('./src/utils/notify');
 const cron = require('node-cron');
@@ -157,6 +155,11 @@ const userSchema = new mongoose.Schema({
   modules:          { type: [String], default: ['sales'] },
   role:             { type: String, enum: ['user', 'admin'], default: 'user' },
   lastLoginAt:      { type: Date, default: null },
+  payoutBankCode:         { type: String, default: null },
+  payoutBankName:         { type: String, default: null },
+  payoutAccountNumber:    { type: String, default: null },
+  payoutAccountName:      { type: String, default: null },
+  paystackSubaccountCode: { type: String, default: null },
   createdAt:        { type: Date, default: Date.now },
 });
 
@@ -267,6 +270,10 @@ const formatUserResponse = (user) => ({
   timezone:      user.timezone || null,
   plan:          user.plan || 'free',
   role:          user.role || 'user',
+  payoutBankName:      user.payoutBankName || null,
+  payoutAccountNumber: user.payoutAccountNumber || null,
+  payoutAccountName:   user.payoutAccountName || null,
+  payoutActive:        !!user.paystackSubaccountCode,
 });
 
 // ── Health check ──
@@ -279,7 +286,6 @@ app.post('/api/auth/register', async (req, res) => {
     return res.status(400).json({ error: 'email, businessName and password are required' });
   if (password.length < 8)
     return res.status(400).json({ error: 'Password must be at least 8 characters' });
-
   try {
     if (isDisposableEmail(email))
       return res.status(400).json({ error: 'Disposable email addresses are not allowed. Please use a real email.' });
@@ -414,7 +420,6 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     await user.save();
 
     const resetLink = `${process.env.FRONTEND_URL}/reset-password?token=${rawToken}`;
-
     if (!resend) {
       console.log(`[DEV] Password reset link for ${user.email}: ${resetLink}`);
     } else {
@@ -510,6 +515,165 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
   } catch (err) {
     console.error('Profile update error:', err.stack || err);
     res.status(500).json({ error: 'Profile update failed' });
+  }
+});
+
+// ── PAYOUTS: List Banks ──
+app.get('/api/payouts/banks', requireAuth, async (req, res) => {
+  try {
+    const { data } = await axios.get(`${PAYSTACK_BASE_URL}/bank?currency=NGN`, {
+      headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` },
+    });
+    res.json({ success: true, banks: data.data });
+  } catch (err) {
+    console.error('List banks error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to fetch bank list' });
+  }
+});
+
+// ── PAYOUTS: Resolve Account Number ──
+app.post('/api/payouts/resolve-account', requireAuth, async (req, res) => {
+  const { accountNumber, bankCode } = req.body;
+  if (!accountNumber || !bankCode) return res.status(400).json({ error: 'accountNumber and bankCode are required' });
+  try {
+    const { data } = await axios.get(
+      `${PAYSTACK_BASE_URL}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
+    );
+    res.json({ success: true, accountName: data.data.account_name });
+  } catch (err) {
+    console.error('Resolve account error:', err.response?.data || err.message);
+    res.status(400).json({ error: 'Could not verify this account number. Please check the details and try again.' });
+  }
+});
+
+// ── PAYOUTS: Create Subaccount ──
+app.post('/api/payouts/subaccount', requireAuth, async (req, res) => {
+  const { accountNumber, bankCode, bankName } = req.body;
+  if (!accountNumber || !bankCode || !bankName) return res.status(400).json({ error: 'accountNumber, bankCode and bankName are required' });
+
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const resolveRes = await axios.get(
+      `${PAYSTACK_BASE_URL}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}` } }
+    );
+    const accountName = resolveRes.data.data.account_name;
+
+    const subRes = await axios.post(
+      `${PAYSTACK_BASE_URL}/subaccount`,
+      {
+        business_name:     user.businessName,
+        settlement_bank:   bankCode,
+        account_number:    accountNumber,
+        percentage_charge: 0,
+      },
+      { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
+    );
+
+    user.payoutBankCode         = bankCode;
+    user.payoutBankName         = bankName;
+    user.payoutAccountNumber    = accountNumber;
+    user.payoutAccountName      = accountName;
+    user.paystackSubaccountCode = subRes.data.data.subaccount_code;
+    await user.save();
+
+    console.log(`Subaccount created for ${user.email}: ${user.paystackSubaccountCode}`);
+    res.json({ success: true, accountName, subaccountCode: user.paystackSubaccountCode });
+  } catch (err) {
+    console.error('Create subaccount error:', err.response?.data || err.message);
+    res.status(500).json({ error: 'Failed to set up payout account. Please double-check your bank details.' });
+  }
+});
+
+// ── PAYOUTS: Get Status ──
+app.get('/api/payouts/status', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    res.json({
+      success: true,
+      payout: {
+        bankName:       user.payoutBankName || null,
+        accountNumber:  user.payoutAccountNumber || null,
+        accountName:    user.payoutAccountName || null,
+        subaccountCode: user.paystackSubaccountCode || null,
+        active:         !!user.paystackSubaccountCode,
+      },
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch payout status' });
+  }
+});
+
+// ── ADMIN DASHBOARD ──
+app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Access denied. Administrators only.' });
+  }
+  try {
+    const users = await User.find({}, '-password').sort({ createdAt: -1 });
+    const totalUsers = users.length;
+    const premiumUsers = users.filter(u => u.plan !== 'free' && u.plan !== 'basic').length;
+
+    const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+
+    const [
+      totalSalesCount,
+      totalBookingsCount,
+      totalEventsCount,
+      newSignupsThisMonth,
+      activeUsers,
+      revenueAgg,
+      planBreakdownAgg,
+      topBusinessTypesAgg
+    ] = await Promise.all([
+      Sale.countDocuments({}),
+      Booking.countDocuments({}),
+      Event.countDocuments({}),
+      User.countDocuments({ createdAt: { $gte: startOfMonth } }),
+      User.countDocuments({ lastLoginAt: { $gte: thirtyDaysAgo } }),
+      Sale.aggregate([{ $group: { _id: null, total: { $sum: '$total' } } }]),
+      User.aggregate([{ $group: { _id: '$plan', count: { $sum: 1 } } }]),
+      User.aggregate([
+        { $match: { businessType: { $ne: null } } },
+        { $group: { _id: '$businessType', count: { $sum: 1 } } },
+        { $sort: { count: -1 } },
+        { $limit: 5 }
+      ])
+    ]);
+
+    const totalRevenue = revenueAgg[0]?.total || 0;
+    const planBreakdown = planBreakdownAgg.reduce((acc, p) => {
+      acc[p._id || 'free'] = p.count;
+      return acc;
+    }, {});
+    const topBusinessTypes = topBusinessTypesAgg.map(t => ({ type: t._id, count: t.count }));
+    const recentSignups = users.slice(0, 10);
+
+    res.json({
+      success: true,
+      metrics: {
+        totalUsers,
+        activeUsers,
+        newSignupsThisMonth,
+        premiumUsers,
+        totalRevenue,
+        totalSales: totalSalesCount,
+        totalBookings: totalBookingsCount,
+        totalEvents: totalEventsCount,
+        planBreakdown,
+        topBusinessTypes
+      },
+      recentSignups,
+      users
+    });
+  } catch (err) {
+    console.error('Admin Fetch Error:', err);
+    res.status(500).json({ error: 'Failed to retrieve admin system metrics.' });
   }
 });
 
@@ -753,15 +917,17 @@ app.post('/api/subscription/upgrade', requireAuth, async (req, res) => {
     }
 
     const reference = `sub-${user._id}-${Date.now()}`;
+    const payload = {
+      email:        user.email,
+      amount:       Math.round(plan.price * 100),
+      reference,
+      callback_url: callbackUrl || process.env.FRONTEND_URL,
+      metadata:     { type: 'subscription', planId, userId: user._id.toString() },
+    };
+
     const { data } = await axios.post(
       `${PAYSTACK_BASE_URL}/transaction/initialize`,
-      {
-        email:        user.email,
-        amount:       Math.round(plan.price * 100),
-        reference,
-        callback_url: callbackUrl || process.env.FRONTEND_URL,
-        metadata:     { type: 'subscription', planId, userId: user._id.toString() },
-      },
+      payload,
       { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
     );
 
@@ -811,15 +977,31 @@ app.post('/api/payments/initialize', requireAuth, async (req, res) => {
   if (typeof amount !== 'number' || amount <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
 
   try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+
+    const amountInKobo = Math.round(amount * 100);
+    const payload = {
+      email:        req.user.email,
+      amount:       amountInKobo,
+      reference:    saleId,
+      callback_url: callbackUrl || process.env.FRONTEND_URL,
+      metadata:     { saleId, userId: req.user.id, businessName: req.user.businessName },
+    };
+
+    if (user.paystackSubaccountCode) {
+      const plan = getPlan(user.plan);
+      const feePercent = typeof plan.platformFeePercent === 'number' ? plan.platformFeePercent : 0;
+      payload.subaccount = user.paystackSubaccountCode;
+      payload.bearer = 'subaccount';
+      if (feePercent > 0) {
+        payload.transaction_charge = Math.round(amountInKobo * (feePercent / 100));
+      }
+    }
+
     const { data } = await axios.post(
       `${PAYSTACK_BASE_URL}/transaction/initialize`,
-      {
-        email:        req.user.email,
-        amount:       Math.round(amount * 100),
-        reference:    saleId,
-        callback_url: callbackUrl || process.env.FRONTEND_URL,
-        metadata:     { saleId, userId: req.user.id, businessName: req.user.businessName },
-      },
+      payload,
       { headers: { Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`, 'Content-Type': 'application/json' } }
     );
     res.json({ success: true, authorizationUrl: data.data.authorization_url, reference: data.data.reference });
@@ -846,12 +1028,64 @@ app.get('/api/payments/verify/:reference', requireAuth, async (req, res) => {
 });
 
 // ── WEBHOOK ──
-app.post('/webhook/paystack', (req, res) => {
+app.post('/webhook/paystack', (req, res, next) => {
   const sig = req.headers['x-paystack-signature'];
   if (!sig) return res.status(400).end();
-  
-  // Placeholder structure mapping out validation safely
-  res.status(200).json({ received: true });
+  const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.body).digest('hex');
+  const sigBuffer  = Buffer.from(sig, 'utf8');
+  const hashBuffer = Buffer.from(hash, 'utf8');
+  if (sigBuffer.length !== hashBuffer.length || !crypto.timingSafeEqual(sigBuffer, hashBuffer)) {
+    return res.status(400).end();
+  }
+  req.body = JSON.parse(req.body);
+  next();
+}, async (req, res) => {
+  res.sendStatus(200);
+  try {
+    const { event, data } = req.body;
+    if (event === 'charge.success') {
+      const { reference, amount, metadata } = data;
+      console.log(`Payment confirmed: ${amount / 100} ref: ${reference}`);
+
+      if (metadata?.type === 'subscription' && metadata?.userId && metadata?.planId) {
+        await User.findByIdAndUpdate(metadata.userId, { plan: metadata.planId });
+        console.log(`Subscription upgraded via webhook: user ${metadata.userId} -> ${metadata.planId}`);
+
+      } else if (metadata?.ticketId || (reference && reference.startsWith('event-ticket-'))) {
+        const ticketId = metadata?.ticketId || reference.replace('event-ticket-', '');
+        const ticket = await EventTicket.findOneAndUpdate(
+          { _id: ticketId, paymentStatus: { $ne: 'paid' } },
+          { paymentStatus: 'paid', status: 'valid', paymentRef: reference },
+          { new: true }
+        );
+        if (ticket && resend) {
+          const ev = await Event.findById(ticket.eventId);
+          if (ev) {
+            await resend.emails.send({
+              from: EMAIL_FROM,
+              to: ticket.buyerEmail,
+              subject: `Your ticket for ${ev.title}`,
+              html: ticketHtml(ev, ticket),
+            });
+          }
+        }
+
+      } else if (metadata?.bookingId || (reference && reference.startsWith('booking-'))) {
+        const bookingId = metadata?.bookingId || reference.replace('booking-', '');
+        await Booking.findByIdAndUpdate(bookingId, {
+          paymentStatus: 'paid', status: 'confirmed', paymentRef: reference,
+        });
+
+      } else {
+        await Sale.findOneAndUpdate(
+          { id: reference },
+          { synced: 1, verified: true, status: 'completed', provider: 'paystack-webhook' }
+        );
+      }
+    }
+  } catch (err) {
+    console.error('Webhook processing error:', err.stack || err);
+  }
 });
 
 // ── CONNECT ADDITIONAL DELEGATED ROUTERS ──
@@ -869,14 +1103,7 @@ if (process.env.SENTRY_DSN) {
 }
 
 // ── SCHEDULED REMINDERS ──
-// Only enable this on an always-on host (e.g. Railway, Render, a VPS).
-// On serverless hosts (e.g. Vercel) the process doesn't stay alive between
-// requests, so leave ENABLE_CRON unset and instead point an external
-// scheduler (cron-job.org, GitHub Actions, etc.) at:
-//   GET /api/bookings/run-reminders?key=REMINDER_SECRET
-//   GET /api/bookings/run-followups?key=REMINDER_SECRET
 if (process.env.ENABLE_CRON === 'true') {
-  // Every hour, on the hour: check tomorrow's confirmed bookings and email reminders.
   cron.schedule('0 * * * *', async () => {
     try {
       const result = await runReminders();
@@ -886,7 +1113,6 @@ if (process.env.ENABLE_CRON === 'true') {
     }
   });
 
-  // Every hour, at :30: check yesterday's confirmed bookings and send follow-ups.
   cron.schedule('30 * * * *', async () => {
     try {
       const result = await runFollowups();
@@ -900,7 +1126,6 @@ if (process.env.ENABLE_CRON === 'true') {
 }
 
 // Start Server Listen Setup
-app.get('/api/test-sentry', () => { throw new Error('Sentry test error'); });
 connectToDatabase().then(() => {
   app.listen(PORT, () => {
     console.log(`Backend Application listening securely on port ${PORT}`);
