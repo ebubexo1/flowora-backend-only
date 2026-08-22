@@ -84,8 +84,6 @@ app.use(cors({
     'https://floworax.pxxl.run',
     'https://floworax.com',
     'https://app.floworax.com',
-    'https://paytracklite.vercel.app',
-    'https://flowora.vercel.app',
     'https://floworax.vercel.app',
   ],
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
