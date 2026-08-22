@@ -492,15 +492,15 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    if (businessName !== undefined) user.businessName = businessName.trim();
+    if (businessName !== undefined) user.businessName = businessName.trim().slice(0, 100);
     if (businessType !== undefined) user.businessType = businessType ? businessType.trim() : null;
     if (Array.isArray(modules))      user.modules      = modules;
-    if (phone)                      user.phone        = phone.trim();
-    if (address)                    user.address      = address.trim();
+    if (phone)                      user.phone        = phone.trim().slice(0, 20);
+    if (address)                    user.address      = address.trim().slice(0, 300);
     if (bankAccount)                user.bankAccount  = bankAccount.trim();
     if (currency)                   user.currency     = currency.trim();
     if (timezone)                   user.timezone     = timezone.trim();
-    if (profileImage)               user.profileImage = profileImage;
+    if (profileImage && (profileImage.startsWith('http://') || profileImage.startsWith('https://'))) user.profileImage = profileImage.slice(0, 500);
 
     if (newPassword) {
       if (!currentPassword) return res.status(400).json({ error: 'Current password required' });
@@ -617,6 +617,7 @@ app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
     const users = await User.find({}, '-password').sort({ createdAt: -1 });
     const totalUsers = users.length;
     const premiumUsers = users.filter(u => u.plan !== 'free' && u.plan !== 'basic').length;
+    const verifiedUsers = users.filter(u => u.emailVerified).length;
 
     const startOfMonth = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
@@ -661,6 +662,7 @@ app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
         activeUsers,
         newSignupsThisMonth,
         premiumUsers,
+        verifiedUsers,
         totalRevenue,
         totalSales: totalSalesCount,
         totalBookings: totalBookingsCount,
