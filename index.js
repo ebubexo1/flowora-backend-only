@@ -39,13 +39,10 @@ const bcrypt         = require('bcryptjs');
 const jwt            = require('jsonwebtoken');
 const mongoose       = require('mongoose');
 const { getPlan, getPlanList, buildSubscriptionSummary, requireFeature } = require('./src/middleware/plan');
-<<<<<<< HEAD
-=======
 const notificationRoutes = require('./src/routes/notifications');
 const notify = require('./src/utils/notify');
 const cron = require('node-cron');
 const { runReminders, runFollowups } = require('./src/routes/bookings');
->>>>>>> 49320f665c1de8aed09021be7c16c91e94273184
 
 // ── Resend Email Configuration ──
 const { Resend } = require('resend');
@@ -611,8 +608,6 @@ app.get('/api/payouts/status', requireAuth, async (req, res) => {
   }
 });
 
-<<<<<<< HEAD
-=======
 // ── ADMIN DASHBOARD ──
 app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
   if (req.user.role !== 'admin') {
@@ -682,7 +677,6 @@ app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
   }
 });
 
->>>>>>> 49320f665c1de8aed09021be7c16c91e94273184
 // ── CREATE SALE ──
 app.post('/api/sales', requireAuth, requireFeature('sales'), async (req, res) => {
   const { items, itemName, total, paymentMethod, reference, status, profit } = req.body;
