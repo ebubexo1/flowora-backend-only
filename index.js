@@ -82,6 +82,7 @@ app.use(cors({
     'http://localhost:5174',
     'http://localhost:5175',
     'https://floworax.pxxl.run',
+    'https://floworax.vercel.app',
     'https://floworax.com',
     'https://app.floworax.com',
     ],
