@@ -74,14 +74,14 @@ messagingService.setProviders({
 });
 
 if (process.env.AFRICAS_TALKING_API_KEY) {
-  console.log('âœ“ SMS provider: Africa\'s Talking configured');
+  console.log('[OK] SMS provider: Africa\'s Talking configured');
 } else {
-  console.log('âœ— SMS provider: Not configured (AFRICAS_TALKING_API_KEY not set)');
+  console.log('[OFF] SMS provider: Not configured (AFRICAS_TALKING_API_KEY not set)');
 }
 if (process.env.TWILIO_ACCOUNT_SID) {
-  console.log('âœ“ WhatsApp provider: Twilio configured');
+  console.log('[OK] WhatsApp provider: Twilio configured');
 } else {
-  console.log('âœ— WhatsApp provider: Not configured (TWILIO_ACCOUNT_SID not set)');
+  console.log('[OFF] WhatsApp provider: Not configured (TWILIO_ACCOUNT_SID not set)');
 }
 console.log('Messaging service initialized');
 
@@ -135,9 +135,9 @@ app.use(mongoSanitize());
 
 // â”€â”€ Rate limiters â”€â”€
 const authLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  message: { error: 'Too many attempts. Please try again in 15 minutes.' },
+  windowMs: 60 * 60 * 1000,
+  max: 50,
+  message: { error: 'Too many attempts. Please wait a moment and try again.' },
   standardHeaders: true,
   legacyHeaders: false,
 });
@@ -185,6 +185,7 @@ const connectToDatabase = async () => {
 const userSchema = new mongoose.Schema({
   email:            { type: String, required: true, unique: true, lowercase: true, trim: true },
   businessName:     { type: String, required: true, trim: true },
+  slug:             { type: String, unique: true, sparse: true, index: true }, // readable join-link id, e.g. "gracecommunity" - sparse so old accounts without one don't collide on null
   passwordHash:     { type: String, required: true },
   emailVerified:    { type: Boolean, default: false },
   otpHash:          { type: String, default: null },
@@ -198,7 +199,7 @@ const userSchema = new mongoose.Schema({
   bankAccount:      { type: String, default: null },
   currency:         { type: String, default: null },
   timezone:         { type: String, default: null },
-  plan:             { type: String, enum: ['free', 'pro', 'business'], default: 'free' },
+  plan:             { type: String, enum: ['free', 'pro', 'business', 'paid'], default: 'free' },
   modules:          { type: [String], default: ['sales'] },
   role:             { type: String, enum: ['user', 'admin'], default: 'user' },
   lastLoginAt:      { type: Date, default: null },
@@ -242,6 +243,40 @@ const expenseSchema = new mongoose.Schema({
 const User    = mongoose.model('User', userSchema);
 const Sale    = mongoose.model('Sale', saleSchema);
 const Expense = mongoose.model('Expense', expenseSchema);
+
+// â”€â”€ Church/business join-link slugs â”€â”€
+// Turns "Grace Community Church" into "gracecommunity", checking for
+// collisions and appending a number if needed. Existing accounts keep
+// working via their raw ObjectId link (see findOwnerByIdentifier below);
+// this only assigns a slug going forward / when one is missing.
+const slugify = (name) =>
+  (name || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '')
+    .slice(0, 30) || 'church';
+
+const generateUniqueSlug = async (businessName, excludeUserId) => {
+  const base = slugify(businessName);
+  let slug = base;
+  let counter = 1;
+  // eslint-disable-next-line no-await-in-loop
+  while (await User.findOne({ slug, _id: { $ne: excludeUserId } })) {
+    slug = `${base}${counter}`;
+    counter += 1;
+  }
+  return slug;
+};
+
+// Looks an owner up by their slug first, falling back to raw ObjectId so
+// links shared before slugs existed keep working forever.
+const findOwnerByIdentifier = async (identifier, projection) => {
+  const bySlug = await User.findOne({ slug: identifier }, projection);
+  if (bySlug) return bySlug;
+  if (mongoose.Types.ObjectId.isValid(identifier)) {
+    return User.findById(identifier, projection);
+  }
+  return null;
+};
 
 // â”€â”€ Auth middleware â”€â”€
 const requireAuth = (req, res, next) => {
@@ -309,6 +344,7 @@ const formatUserResponse = (user) => ({
   email:         user.email,
   emailVerified: user.emailVerified,
   businessName:  user.businessName,
+  slug:          user.slug || null,
   businessType:  user.businessType || null,
   modules:       user.modules || ['sales'],
   profileImage:  user.profileImage || null,
@@ -347,14 +383,24 @@ app.post('/api/auth/register', async (req, res) => {
     const otpExpiry = new Date(Date.now() + 10 * 60 * 1000);
 
     const passwordHash = await bcrypt.hash(password, 12);
-    const user = await User.create({
-      email:        email.toLowerCase().trim(),
-      businessName: businessName.trim(),
-      passwordHash,
-      plan: 'free',
-      otpHash,
-      otpExpiry,
-    });
+    const slug = await generateUniqueSlug(businessName);
+    let user;
+    try {
+      user = await User.create({
+        email:        email.toLowerCase().trim(),
+        businessName: businessName.trim(),
+        slug,
+        passwordHash,
+        plan: 'free',
+        otpHash,
+        otpExpiry,
+      });
+    } catch (err) {
+      // Duplicate-email race between findOne and create
+      if (err && (err.code === 11000 || (err.name === 'MongoServerError' && err.code === 11000)))
+        return res.status(409).json({ error: 'An account with this email already exists' });
+      throw err;
+    }
 
     await sendOTPEmail(user.email, otp);
 
@@ -365,7 +411,13 @@ app.post('/api/auth/register', async (req, res) => {
     );
 
     console.log(`Registered: ${user.email}`);
-    res.status(201).json({ success: true, token, user: formatUserResponse(user) });
+    res.status(201).json({
+      success: true,
+      token,
+      user: formatUserResponse(user),
+      email: user.email,
+      requiresVerification: !user.emailVerified,
+    });
   } catch (err) {
     console.error('Register error:', err.stack || err);
     res.status(500).json({ error: 'Registration failed' });
@@ -387,6 +439,10 @@ app.post('/api/auth/login', async (req, res) => {
 
     // â”€â”€ Update lastLoginAt â”€â”€
     await User.findByIdAndUpdate(user._id, { lastLoginAt: new Date() });
+    if (!user.slug) {
+      user.slug = await generateUniqueSlug(user.businessName, user._id);
+      await User.findByIdAndUpdate(user._id, { slug: user.slug }); // backfill for accounts predating slugs, without triggering full validation
+    }
 
     const token = jwt.sign(
       { id: user._id.toString(), email: user.email, businessName: user.businessName, role: user.role },
@@ -526,6 +582,10 @@ app.get('/api/auth/me', requireAuth, async (req, res) => {
   try {
     const user = await User.findById(req.user.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
+    if (!user.slug) {
+      user.slug = await generateUniqueSlug(user.businessName, user._id);
+      await User.findByIdAndUpdate(user._id, { slug: user.slug });
+    }
     res.json({ success: true, user: formatUserResponse(user) });
   } catch (err) {
     console.error('Get me error:', err.stack || err);
@@ -542,6 +602,7 @@ app.patch('/api/auth/profile', requireAuth, async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
 
     if (businessName !== undefined) user.businessName = businessName.trim().slice(0, 100);
+    if (!user.slug) user.slug = await generateUniqueSlug(user.businessName, user._id); // backfill for accounts created before slugs existed
     if (businessType !== undefined) user.businessType = businessType ? businessType.trim() : null;
     if (Array.isArray(modules))      user.modules      = modules;
     if (phone)                      user.phone        = phone.trim().slice(0, 20);
@@ -801,6 +862,16 @@ app.get('/api/sales', requireAuth, async (req, res) => {
   }
 });
 
+app.delete('/api/sales', requireAuth, async (req, res) => {
+  try {
+    const result = await Sale.deleteMany({ userId: req.user.id });
+    res.json({ success: true, deletedCount: result.deletedCount || 0 });
+  } catch (err) {
+    console.error('Clear sales error:', err);
+    res.status(500).json({ error: 'Failed to clear sales' });
+  }
+});
+
 // â”€â”€ CREATE EXPENSE â”€â”€
 app.post('/api/expenses', requireAuth, async (req, res) => {
   const { description, amount, category } = req.body;
@@ -1017,7 +1088,7 @@ app.get('/api/subscription/verify/:reference', requireAuth, async (req, res) => 
         }
         await user.save();
         const plan = getPlanList().find((p) => p.id === planId);
-        await notify(user._id, 'Subscription upgraded', `Payment received â€” you're now on the ${plan?.name || planId} plan.`, 'subscription');
+        await notify(user._id, 'Subscription upgraded', `Payment received - you're now on the ${plan?.name || planId} plan.`, 'subscription');
         return res.json({ success: true, subscription: await buildSubscriptionSummary(req.user.id), user: formatUserResponse(user) });
       }
     }
@@ -1033,6 +1104,7 @@ app.post('/api/payments/initialize', requireAuth, async (req, res) => {
   const { amount, saleId, callbackUrl } = req.body;
   if (!amount || !saleId) return res.status(400).json({ error: 'amount and saleId are required' });
   if (typeof amount !== 'number' || amount <= 0) return res.status(400).json({ error: 'amount must be a positive number' });
+  if (!PAYSTACK_SECRET_KEY) return res.status(503).json({ error: 'Paystack is not configured. Add a test secret key (sk_test_...) to the backend environment.' });
 
   try {
     const user = await User.findById(req.user.id);
@@ -1182,9 +1254,9 @@ if (process.env.ENABLE_CRON === 'true') {
     }
   });
 
-  // â”€â”€ Automation scheduler: runs every 5 minutes to process recurring/new-member automations â”€â”€
+  // â”€â”€ Automation scheduler: runs every minute for exact reminder times â”€â”€
   const automationScheduler = new AutomationScheduler(messagingService);
-  cron.schedule('*/5 * * * *', async () => {
+  cron.schedule('* * * * *', async () => {
     try {
       const result = await automationScheduler.runScheduler();
       if (result.success && (result.schedulesSent > 0 || result.newMembersWelcomed > 0)) {
@@ -1210,7 +1282,7 @@ if (process.env.ENABLE_CRON === 'true') {
     }
   });
 
-  console.log('Cron scheduler enabled: reminders hourly, follow-ups hourly (offset 30m), automations every 5m');
+  console.log('Cron scheduler enabled: reminders hourly, follow-ups hourly (offset 30m), automations every minute');
 }
 
 // Start Server Listen Setup
