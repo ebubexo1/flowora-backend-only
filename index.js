@@ -210,6 +210,11 @@ const userSchema = new mongoose.Schema({
   paystackSubaccountCode: { type: String, default: null },
   smsCredits:             { type: Number, default: null }, // null = unmetered; set to a number on Paid-plan activation
   whatsappCredits:        { type: Number, default: null }, // null = unmetered; set to a number on Paid-plan activation
+  referralCode:     { type: String, unique: true, sparse: true, index: true },
+  referredBy:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  referralRewarded: { type: Boolean, default: false },  // true once referrer was paid for this user's first payment
+  referralEarnings: { type: Number, default: 0 },       // total reward earned, naira
+  referralPaidOut:  { type: Number, default: 0 },       // amount already settled to bank, naira
   createdAt:        { type: Date, default: Date.now },
 });
 
@@ -276,6 +281,62 @@ const findOwnerByIdentifier = async (identifier, projection) => {
     return User.findById(identifier, projection);
   }
   return null;
+};
+
+// ── Referral / affiliate system ──
+// Referrer earns REFERRAL_REWARD_NGN when a referred user completes their
+// FIRST verified payment (sale or subscription). Idempotent via the
+// referred user's referralRewarded flag.
+const REFERRAL_REWARD_NGN = Number(process.env.REFERRAL_REWARD_NGN || 2000);
+
+const randomReferralCode = () => {
+  // unambiguous alphabet: no 0/O/1/I/L confusion on screenshots
+  const alphabet = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
+  let code = '';
+  for (let i = 0; i < 8; i += 1) code += alphabet[crypto.randomInt(alphabet.length)];
+  return code;
+};
+
+const generateUniqueReferralCode = async () => {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    const code = randomReferralCode();
+    // eslint-disable-next-line no-await-in-loop
+    if (!(await User.findOne({ referralCode: code }))) return code;
+  }
+  // 10 collisions in a row is astronomically unlikely; fall back to timestamped code
+  return `${randomReferralCode().slice(0, 5)}${Date.now().toString(36).toUpperCase().slice(-5)}`;
+};
+
+const ensureReferralCode = async (user) => {
+  if (user.referralCode) return user.referralCode;
+  user.referralCode = await generateUniqueReferralCode();
+  await User.findByIdAndUpdate(user._id, { referralCode: user.referralCode });
+  return user.referralCode;
+};
+
+const rewardReferrer = async (referredUserId) => {
+  try {
+    const referred = await User.findById(referredUserId);
+    if (!referred || referred.referralRewarded || !referred.referredBy) return;
+    referred.referralRewarded = true;
+    await referred.save();
+    const referrer = await User.findByIdAndUpdate(
+      referred.referredBy,
+      { $inc: { referralEarnings: REFERRAL_REWARD_NGN } },
+      { new: true }
+    );
+    if (referrer) {
+      await notify(
+        referrer._id,
+        'Referral bonus earned 🎉',
+        `You earned ₦${REFERRAL_REWARD_NGN.toLocaleString()} — ${referred.businessName || referred.email} just made their first payment.`,
+        'referral'
+      );
+      console.log(`Referral reward: ₦${REFERRAL_REWARD_NGN} credited to ${referrer.email} for ${referred.email}`);
+    }
+  } catch (err) {
+    console.error('Referral reward error:', err.message);
+  }
 };
 
 // â”€â”€ Auth middleware â”€â”€
@@ -347,6 +408,7 @@ const formatUserResponse = (user) => ({
   slug:          user.slug || null,
   businessType:  user.businessType || null,
   modules:       user.modules || ['sales'],
+  referralCode:  user.referralCode || null,
   profileImage:  user.profileImage || null,
   phone:         user.phone || null,
   address:       user.address || null,
@@ -366,7 +428,7 @@ app.get('/', (req, res) => res.json({ status: 'Flowora API running' }));
 
 // â”€â”€ REGISTER â”€â”€
 app.post('/api/auth/register', async (req, res) => {
-  const { email, businessName, password } = req.body;
+  const { email, businessName, password, ref } = req.body;
   if (!email || !businessName || !password)
     return res.status(400).json({ error: 'email, businessName and password are required' });
   if (password.length < 8)
@@ -384,6 +446,15 @@ app.post('/api/auth/register', async (req, res) => {
 
     const passwordHash = await bcrypt.hash(password, 12);
     const slug = await generateUniqueSlug(businessName);
+    const referralCode = await generateUniqueReferralCode();
+
+    // Attribute referral (optional ?ref / body.ref — a referral CODE)
+    let referredBy = null;
+    if (ref) {
+      const referrer = await User.findOne({ referralCode: String(ref).toUpperCase().trim() });
+      if (referrer && referrer.email !== email.toLowerCase().trim()) referredBy = referrer._id;
+    }
+
     let user;
     try {
       user = await User.create({
@@ -394,6 +465,8 @@ app.post('/api/auth/register', async (req, res) => {
         plan: 'free',
         otpHash,
         otpExpiry,
+        referralCode,
+        referredBy,
       });
     } catch (err) {
       // Duplicate-email race between findOne and create
@@ -443,6 +516,7 @@ app.post('/api/auth/login', async (req, res) => {
       user.slug = await generateUniqueSlug(user.businessName, user._id);
       await User.findByIdAndUpdate(user._id, { slug: user.slug }); // backfill for accounts predating slugs, without triggering full validation
     }
+    if (!user.referralCode) await ensureReferralCode(user);
 
     const token = jwt.sign(
       { id: user._id.toString(), email: user.email, businessName: user.businessName, role: user.role },
@@ -789,6 +863,71 @@ app.get('/api/admin/dashboard', requireAuth, async (req, res) => {
   }
 });
 
+// ── REFERRALS / AFFILIATE ──
+app.get('/api/referrals', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    await ensureReferralCode(user);
+
+    const referrals = await User.find({ referredBy: user._id })
+      .select('email businessName plan referralRewarded createdAt')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const masked = referrals.map((r) => ({
+      id: r._id,
+      businessName: r.businessName,
+      email: r.email ? r.email.replace(/^(.{2}).+(@.+)$/, '$1***$2') : '',
+      plan: r.plan,
+      status: r.referralRewarded ? 'earned' : 'signed up',
+      earned: r.referralRewarded ? REFERRAL_REWARD_NGN : 0,
+      joinedAt: r.createdAt,
+    }));
+
+    res.json({
+      success: true,
+      code: user.referralCode,
+      link: `${process.env.FRONTEND_URL || 'https://floworax.com'}/register?ref=${user.referralCode}`,
+      reward: REFERRAL_REWARD_NGN,
+      minWithdrawal: 5000,
+      referredCount: masked.length,
+      convertedCount: masked.filter((r) => r.status === 'earned').length,
+      earnings: user.referralEarnings || 0,
+      paidOut: user.referralPaidOut || 0,
+      pending: (user.referralEarnings || 0) - (user.referralPaidOut || 0),
+      referrals: masked,
+    });
+  } catch (err) {
+    console.error('Referrals error:', err.stack || err);
+    res.status(500).json({ error: 'Failed to load referral data' });
+  }
+});
+
+// Withdrawal request — payouts are settled manually via bank transfer for now.
+// Records the request and notifies; never mutates balances here.
+app.post('/api/referrals/withdraw', requireAuth, async (req, res) => {
+  try {
+    const user = await User.findById(req.user.id);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const pending = (user.referralEarnings || 0) - (user.referralPaidOut || 0);
+    if (pending < 5000) {
+      return res.status(400).json({ error: `Minimum withdrawal is ₦5,000. You have ₦${pending.toLocaleString()} pending.` });
+    }
+    await notify(
+      user._id,
+      'Withdrawal request received',
+      `Your ₦${pending.toLocaleString()} referral earnings withdrawal was received. Payouts are processed via bank transfer within 3 business days.`,
+      'referral'
+    );
+    console.log(`Withdrawal request: ${user.email} for ₦${pending}`);
+    res.json({ success: true, message: 'Withdrawal request received. Payouts are processed via bank transfer within 3 business days.', pending });
+  } catch (err) {
+    console.error('Withdrawal error:', err.stack || err);
+    res.status(500).json({ error: 'Failed to process withdrawal request' });
+  }
+});
+
 // â”€â”€ CREATE SALE â”€â”€
 app.post('/api/sales', requireAuth, requireFeature('sales'), async (req, res) => {
   const { items, itemName, total, paymentMethod, reference, status, profit } = req.body;
@@ -1089,6 +1228,7 @@ app.get('/api/subscription/verify/:reference', requireAuth, async (req, res) => 
         await user.save();
         const plan = getPlanList().find((p) => p.id === planId);
         await notify(user._id, 'Subscription upgraded', `Payment received - you're now on the ${plan?.name || planId} plan.`, 'subscription');
+        await rewardReferrer(req.user.id);
         return res.json({ success: true, subscription: await buildSubscriptionSummary(req.user.id), user: formatUserResponse(user) });
       }
     }
@@ -1150,6 +1290,7 @@ app.get('/api/payments/verify/:reference', requireAuth, async (req, res) => {
       { id: reference, userId: req.user.id },
       { synced: 1, verified: true, status: 'completed', provider: 'paystack' }
     );
+    await rewardReferrer(req.user.id);
   } else {
     await notify(req.user.id, 'Payment failed', `We couldn't verify payment for sale reference ${reference}.`, 'payment');
   }
@@ -1180,6 +1321,7 @@ app.post('/webhook/paystack', (req, res, next) => {
       if (metadata?.type === 'subscription' && metadata?.userId && metadata?.planId) {
         await User.findByIdAndUpdate(metadata.userId, { plan: metadata.planId });
         console.log(`Subscription upgraded via webhook: user ${metadata.userId} -> ${metadata.planId}`);
+        await rewardReferrer(metadata.userId);
 
       } else if (metadata?.ticketId || (reference && reference.startsWith('event-ticket-'))) {
         const ticketId = metadata?.ticketId || reference.replace('event-ticket-', '');
