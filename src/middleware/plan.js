@@ -8,7 +8,11 @@ const PLAN_CATALOG = {
     features: ['sales', 'services', 'bookings', 'finance', 'reports', 'events'],
     limits: { sales: 50, bookings: 40, services: 8, events: 3 },
     badge: 'Best for starters',
-    platformFeePercent: 2,
+    // Launch-time removal (Nov 2026): platform fee set to 0 so early users
+    // keep 100% of card payments. To re-enable the take-rate later, set this
+    // back to 2 (or higher) — the split logic in /api/payments/initialize
+    // is untouched and works automatically.
+    platformFeePercent: 0,
   },
   paid: {
     name: 'Paid',
