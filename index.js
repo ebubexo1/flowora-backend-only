@@ -284,10 +284,11 @@ const findOwnerByIdentifier = async (identifier, projection) => {
 };
 
 // ── Referral / affiliate system ──
-// Referrer earns REFERRAL_REWARD_NGN when a referred user completes their
-// FIRST verified payment (sale or subscription). Idempotent via the
-// referred user's referralRewarded flag.
-const REFERRAL_REWARD_NGN = Number(process.env.REFERRAL_REWARD_NGN || 2000);
+// Referrer earns REFERRAL_REWARD_PERCENT of the referred user's first
+// SUBSCRIPTION payment (sale card payments do NOT trigger rewards — the
+// platform only earns a small fee on those). Idempotent via the referred
+// user's referralRewarded flag.
+const REFERRAL_REWARD_PERCENT = Number(process.env.REFERRAL_REWARD_PERCENT || 30);
 
 const randomReferralCode = () => {
   // unambiguous alphabet: no 0/O/1/I/L confusion on screenshots
@@ -314,25 +315,28 @@ const ensureReferralCode = async (user) => {
   return user.referralCode;
 };
 
-const rewardReferrer = async (referredUserId) => {
+const rewardReferrer = async (referredUserId, paymentAmountNGN) => {
   try {
     const referred = await User.findById(referredUserId);
     if (!referred || referred.referralRewarded || !referred.referredBy) return;
+    if (!paymentAmountNGN || paymentAmountNGN <= 0) return;
+    const reward = Math.round((paymentAmountNGN * REFERRAL_REWARD_PERCENT) / 100);
+    if (reward <= 0) return;
     referred.referralRewarded = true;
     await referred.save();
     const referrer = await User.findByIdAndUpdate(
       referred.referredBy,
-      { $inc: { referralEarnings: REFERRAL_REWARD_NGN } },
+      { $inc: { referralEarnings: reward } },
       { new: true }
     );
     if (referrer) {
       await notify(
         referrer._id,
         'Referral bonus earned 🎉',
-        `You earned ₦${REFERRAL_REWARD_NGN.toLocaleString()} — ${referred.businessName || referred.email} just made their first payment.`,
+        `You earned ₦${reward.toLocaleString()} — ${referred.businessName || referred.email} just subscribed to a paid plan.`,
         'referral'
       );
-      console.log(`Referral reward: ₦${REFERRAL_REWARD_NGN} credited to ${referrer.email} for ${referred.email}`);
+      console.log(`Referral reward: ₦${reward} (${REFERRAL_REWARD_PERCENT}% of ₦${paymentAmountNGN}) credited to ${referrer.email} for ${referred.email}`);
     }
   } catch (err) {
     console.error('Referral reward error:', err.message);
@@ -881,7 +885,6 @@ app.get('/api/referrals', requireAuth, async (req, res) => {
       email: r.email ? r.email.replace(/^(.{2}).+(@.+)$/, '$1***$2') : '',
       plan: r.plan,
       status: r.referralRewarded ? 'earned' : 'signed up',
-      earned: r.referralRewarded ? REFERRAL_REWARD_NGN : 0,
       joinedAt: r.createdAt,
     }));
 
@@ -889,7 +892,7 @@ app.get('/api/referrals', requireAuth, async (req, res) => {
       success: true,
       code: user.referralCode,
       link: `${process.env.FRONTEND_URL || 'https://floworax.com'}/register?ref=${user.referralCode}`,
-      reward: REFERRAL_REWARD_NGN,
+      rewardPercent: REFERRAL_REWARD_PERCENT,
       minWithdrawal: 5000,
       referredCount: masked.length,
       convertedCount: masked.filter((r) => r.status === 'earned').length,
@@ -1228,7 +1231,7 @@ app.get('/api/subscription/verify/:reference', requireAuth, async (req, res) => 
         await user.save();
         const plan = getPlanList().find((p) => p.id === planId);
         await notify(user._id, 'Subscription upgraded', `Payment received - you're now on the ${plan?.name || planId} plan.`, 'subscription');
-        await rewardReferrer(req.user.id);
+        await rewardReferrer(req.user.id, (data?.data?.amount || 0) / 100);
         return res.json({ success: true, subscription: await buildSubscriptionSummary(req.user.id), user: formatUserResponse(user) });
       }
     }
@@ -1290,7 +1293,8 @@ app.get('/api/payments/verify/:reference', requireAuth, async (req, res) => {
       { id: reference, userId: req.user.id },
       { synced: 1, verified: true, status: 'completed', provider: 'paystack' }
     );
-    await rewardReferrer(req.user.id);
+    // NOTE: no referral reward here — sale card payments are the merchant's
+    // money; rewards only fire on subscription conversions.
   } else {
     await notify(req.user.id, 'Payment failed', `We couldn't verify payment for sale reference ${reference}.`, 'payment');
   }
@@ -1321,7 +1325,7 @@ app.post('/webhook/paystack', (req, res, next) => {
       if (metadata?.type === 'subscription' && metadata?.userId && metadata?.planId) {
         await User.findByIdAndUpdate(metadata.userId, { plan: metadata.planId });
         console.log(`Subscription upgraded via webhook: user ${metadata.userId} -> ${metadata.planId}`);
-        await rewardReferrer(metadata.userId);
+        await rewardReferrer(metadata.userId, (amount || 0) / 100);
 
       } else if (metadata?.ticketId || (reference && reference.startsWith('event-ticket-'))) {
         const ticketId = metadata?.ticketId || reference.replace('event-ticket-', '');
